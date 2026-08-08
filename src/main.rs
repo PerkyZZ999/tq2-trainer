@@ -5,6 +5,7 @@ mod error;
 mod exp;
 mod fingerprint;
 mod gold;
+mod live_patch;
 mod maps;
 mod memory;
 mod patch;
@@ -19,11 +20,9 @@ use clap::Parser;
 use std::time::Duration;
 
 use crate::cli::{Cli, Commands, ResearchAction, ResearchTarget};
-use crate::exp::{apply_multiplier, detect_multiplier, find_module_base, locate_addxp};
-use crate::gold::{
-    GoldAddOptions, SellGoldOptions, add_gold, arm_sell_gold, default_wait_timeout,
-    disarm_sell_gold, locate_gold_sites, sell_gold_is_armed,
-};
+use crate::exp::find_module_base;
+use crate::gold::{GoldAddOptions, SellGoldOptions, default_wait_timeout};
+use crate::live_patch::LivePatch;
 use crate::maps::{format_game_module_summary, read_maps};
 use crate::memory::ProcessMemory;
 use crate::process::{GAME_EXE_NAME, find_game_process};
@@ -139,15 +138,15 @@ fn cmd_status(verbose: bool) -> anyhow::Result<()> {
         }
     }
 
-    let mem = ProcessMemory::new(&game);
-    match locate_addxp(&mem, &maps) {
-        Ok(sites) => {
+    let patch = LivePatch::open(&game, &maps, false, verbose);
+    match patch.exp_status() {
+        Ok((sites, mult)) => {
             println!("Build: supported (AddXP signature matched)");
             if verbose {
                 println!("Module base: 0x{:x}", sites.module_base);
                 println!("AddXP:       0x{:x}", sites.addxp);
             }
-            match detect_multiplier(&mem, &sites)? {
+            match mult {
                 Some(1) => println!("Current multiplier: 1x (original)"),
                 Some(m) => println!("Current multiplier: {m}x"),
                 None => println!("Current multiplier: unknown patch state"),
@@ -162,13 +161,13 @@ fn cmd_status(verbose: bool) -> anyhow::Result<()> {
         }
     }
 
-    match locate_gold_sites(&mem, &maps) {
-        Ok(sites) => {
+    match patch.gold_status() {
+        Ok((sites, armed)) => {
             println!("Gold sites: supported");
-            match sell_gold_is_armed(&mem, &sites) {
-                Ok(true) => println!("sell-gold: ARMED (next sale payout overridden)"),
-                Ok(false) => println!("sell-gold: idle"),
-                Err(_) => println!("sell-gold: unknown"),
+            if armed {
+                println!("sell-gold: ARMED (next sale payout overridden)");
+            } else {
+                println!("sell-gold: idle");
             }
             if verbose {
                 println!("Sell payout: 0x{:x}", sites.sell_entry);
@@ -255,20 +254,19 @@ fn cmd_scan(verbose: bool) -> anyhow::Result<()> {
 fn cmd_xp(multiplier: u32, force: bool, verbose: bool) -> anyhow::Result<()> {
     let game = find_game_process().context("process discovery")?;
     let maps = read_maps(&game).context("reading memory maps")?;
-    let mem = ProcessMemory::new(&game);
+    let patch = LivePatch::open(&game, &maps, force, verbose);
 
     println!("Titan Quest II found");
     println!("PID: {}", game.pid);
 
-    let sites = locate_addxp(&mem, &maps).context("AddXP signature")?;
+    let (sites, before) = patch.exp_status().context("AddXP signature")?;
     println!("Supported build detected");
     if verbose {
         println!("AddXP at 0x{:x}", sites.addxp);
     }
 
-    let before = detect_multiplier(&mem, &sites)?.unwrap_or(0);
-    let after =
-        apply_multiplier(&game, &maps, multiplier, force, verbose).context("apply EXP patch")?;
+    let before = before.unwrap_or(0);
+    let after = patch.apply_exp(multiplier).context("apply EXP patch")?;
 
     if multiplier == 1 {
         println!("EXP multiplier: {before}x -> 1x (restored)");
@@ -296,6 +294,7 @@ fn cmd_gold(
 
     let game = find_game_process().context("process discovery")?;
     let maps = read_maps(&game).context("reading memory maps")?;
+    let patch = LivePatch::open(&game, &maps, force, verbose);
     let timeout = if timeout_secs == 0 {
         default_wait_timeout()
     } else {
@@ -307,18 +306,15 @@ fn cmd_gold(
     println!("Arming UNSAFE one-shot gold grant (+{amount})...");
     println!("Open Currencies / inventory (so GetGold runs), then wait.");
 
-    let result = add_gold(
-        &game,
-        &maps,
-        &GoldAddOptions {
+    let result = patch
+        .apply_gold_unsafe(GoldAddOptions {
             amount,
             current,
             timeout,
             force_build: force,
             verbose,
-        },
-    )
-    .context("add gold")?;
+        })
+        .context("add gold")?;
 
     println!(
         "Gold: {} -> {} (+{})",
@@ -339,12 +335,13 @@ fn cmd_sell_gold(
 ) -> anyhow::Result<()> {
     let game = find_game_process().context("process discovery")?;
     let maps = read_maps(&game).context("reading memory maps")?;
+    let patch = LivePatch::open(&game, &maps, force, verbose);
 
     println!("Titan Quest II found");
     println!("PID: {}", game.pid);
 
     if disarm {
-        disarm_sell_gold(&game, &maps, verbose).context("disarm sell-gold")?;
+        patch.disarm_sell_gold().context("disarm sell-gold")?;
         println!("sell-gold disarmed (original payout restored).");
         return Ok(());
     }
@@ -369,19 +366,16 @@ fn cmd_sell_gold(
         );
     }
 
-    let result = arm_sell_gold(
-        &game,
-        &maps,
-        &SellGoldOptions {
+    let result = patch
+        .apply_sell_gold(SellGoldOptions {
             amount,
             current,
             timeout,
             no_wait,
             force_build: force,
             verbose,
-        },
-    )
-    .context("sell-gold")?;
+        })
+        .context("sell-gold")?;
 
     if result.armed_only {
         println!(
