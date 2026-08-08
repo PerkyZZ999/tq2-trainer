@@ -3,6 +3,7 @@
 mod cli;
 mod error;
 mod exp;
+mod fingerprint;
 mod gold;
 mod maps;
 mod memory;
@@ -10,6 +11,7 @@ mod patch;
 mod process;
 mod research;
 mod scanner;
+mod x86;
 
 use anyhow::Context;
 use clap::Parser;
@@ -19,8 +21,8 @@ use std::time::Duration;
 use crate::cli::{Cli, Commands, ResearchAction, ResearchTarget};
 use crate::exp::{apply_multiplier, detect_multiplier, find_module_base, locate_addxp};
 use crate::gold::{
-    add_gold, arm_sell_gold, default_wait_timeout, disarm_sell_gold, locate_gold_sites,
-    sell_gold_is_armed,
+    GoldAddOptions, SellGoldOptions, add_gold, arm_sell_gold, default_wait_timeout,
+    disarm_sell_gold, locate_gold_sites, sell_gold_is_armed,
 };
 use crate::maps::{format_game_module_summary, read_maps};
 use crate::memory::ProcessMemory;
@@ -43,21 +45,36 @@ fn run() -> anyhow::Result<()> {
         Commands::Status => cmd_status(cli.verbose)?,
         Commands::Scan => cmd_scan(cli.verbose)?,
         Commands::Research { target, action } => cmd_research(target, action, cli.verbose)?,
-        Commands::Xp { multiplier } => cmd_xp(multiplier, cli.verbose)?,
-        Commands::Restore => cmd_xp(1, cli.verbose)?,
+        Commands::Xp { multiplier } => cmd_xp(multiplier, cli.force, cli.verbose)?,
+        Commands::Restore => cmd_xp(1, cli.force, cli.verbose)?,
         Commands::Gold {
             amount,
             current,
             timeout,
             unsafe_grant,
-        } => cmd_gold(amount, current, timeout, unsafe_grant, cli.verbose)?,
+        } => cmd_gold(
+            amount,
+            current,
+            timeout,
+            unsafe_grant,
+            cli.force,
+            cli.verbose,
+        )?,
         Commands::SellGold {
             amount,
             current,
             timeout,
             no_wait,
             disarm,
-        } => cmd_sell_gold(amount, current, timeout, no_wait, disarm, cli.verbose)?,
+        } => cmd_sell_gold(
+            amount,
+            current,
+            timeout,
+            no_wait,
+            disarm,
+            cli.force,
+            cli.verbose,
+        )?,
     }
 
     Ok(())
@@ -235,7 +252,7 @@ fn cmd_scan(verbose: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_xp(multiplier: u32, verbose: bool) -> anyhow::Result<()> {
+fn cmd_xp(multiplier: u32, force: bool, verbose: bool) -> anyhow::Result<()> {
     let game = find_game_process().context("process discovery")?;
     let maps = read_maps(&game).context("reading memory maps")?;
     let mem = ProcessMemory::new(&game);
@@ -250,7 +267,8 @@ fn cmd_xp(multiplier: u32, verbose: bool) -> anyhow::Result<()> {
     }
 
     let before = detect_multiplier(&mem, &sites)?.unwrap_or(0);
-    let after = apply_multiplier(&game, &maps, multiplier, verbose).context("apply EXP patch")?;
+    let after =
+        apply_multiplier(&game, &maps, multiplier, force, verbose).context("apply EXP patch")?;
 
     if multiplier == 1 {
         println!("EXP multiplier: {before}x -> 1x (restored)");
@@ -266,6 +284,7 @@ fn cmd_gold(
     current: Option<i64>,
     timeout_secs: u64,
     unsafe_grant: bool,
+    force: bool,
     verbose: bool,
 ) -> anyhow::Result<()> {
     if !unsafe_grant {
@@ -288,7 +307,18 @@ fn cmd_gold(
     println!("Arming UNSAFE one-shot gold grant (+{amount})...");
     println!("Open Currencies / inventory (so GetGold runs), then wait.");
 
-    let result = add_gold(&game, &maps, amount, current, timeout, verbose).context("add gold")?;
+    let result = add_gold(
+        &game,
+        &maps,
+        &GoldAddOptions {
+            amount,
+            current,
+            timeout,
+            force_build: force,
+            verbose,
+        },
+    )
+    .context("add gold")?;
 
     println!(
         "Gold: {} -> {} (+{})",
@@ -304,6 +334,7 @@ fn cmd_sell_gold(
     timeout_secs: u64,
     no_wait: bool,
     disarm: bool,
+    force: bool,
     verbose: bool,
 ) -> anyhow::Result<()> {
     let game = find_game_process().context("process discovery")?;
@@ -338,8 +369,19 @@ fn cmd_sell_gold(
         );
     }
 
-    let result = arm_sell_gold(&game, &maps, amount, current, timeout, no_wait, verbose)
-        .context("sell-gold")?;
+    let result = arm_sell_gold(
+        &game,
+        &maps,
+        &SellGoldOptions {
+            amount,
+            current,
+            timeout,
+            no_wait,
+            force_build: force,
+            verbose,
+        },
+    )
+    .context("sell-gold")?;
 
     if result.armed_only {
         println!(

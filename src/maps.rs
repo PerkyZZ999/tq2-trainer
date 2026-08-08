@@ -34,13 +34,13 @@ impl MemoryRegion {
         )
     }
 
-    /// True if this mapping's pathname refers to the TQ2 shipping executable.
+    /// True if this mapping's pathname is exactly the TQ2 shipping executable.
     pub fn is_game_module(&self) -> bool {
         self.pathname
             .as_ref()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
-            .is_some_and(|name| name == GAME_EXE_NAME || name.contains(GAME_EXE_NAME))
+            .is_some_and(|name| name == GAME_EXE_NAME)
     }
 }
 

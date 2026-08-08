@@ -1,11 +1,13 @@
 //! EXP multiplier patch based on the validated AddXP signature.
 
 use crate::error::{Result, TrainerError};
+use crate::fingerprint::assert_supported_build;
 use crate::maps::ProcessMaps;
 use crate::memory::ProcessMemory;
 use crate::patch::{MemoryPatch, PatchState};
 use crate::process::GameProcess;
-use crate::scanner::{parse_pattern, scan_pattern};
+use crate::scanner::{parse_pattern, scan_pattern, scan_pattern_chunked};
+use crate::x86::{encode_i32_le, jmp_rel, rel32};
 
 /// PE-relative RVA of the AddXP native body (from offline research).
 pub const ADDXP_RVA: usize = 0x6B3_A890;
@@ -48,7 +50,11 @@ pub struct ExpPatchSites {
 
 impl ExpPatchSites {
     pub fn from_module_base(module_base: usize) -> Self {
-        let addxp = module_base + ADDXP_RVA;
+        Self::from_addxp(module_base, module_base + ADDXP_RVA)
+    }
+
+    /// Build patch sites from a discovered AddXP prologue address.
+    pub fn from_addxp(module_base: usize, addxp: usize) -> Self {
         Self {
             module_base,
             addxp,
@@ -71,31 +77,57 @@ pub fn find_module_base(maps: &ProcessMaps) -> Result<usize> {
         })
 }
 
+fn validate_addxp_surroundings(mem: &ProcessMemory<'_>, sites: &ExpPatchSites) -> Result<()> {
+    let cave = mem.read_vec(sites.cave, CAVE_LEN)?;
+    let entry = mem.read_vec(sites.entry, 6)?;
+    let cave_ok = cave.iter().all(|&b| b == 0xCC) || looks_like_our_cave(&cave);
+    let entry_ok = entry == ENTRY_ORIGINAL || entry[0] == 0xE9;
+    if !cave_ok || !entry_ok {
+        return Err(TrainerError::Other(format!(
+            "AddXP site found at 0x{:x}, but surrounding bytes are unexpected.\n\
+             entry={:02x?} cave={:02x?}\n\
+             Refusing to write memory.",
+            sites.addxp, entry, cave
+        )));
+    }
+    Ok(())
+}
+
+fn scan_addxp_in_executable(
+    mem: &ProcessMemory<'_>,
+    maps: &ProcessMaps,
+    pattern: &[crate::scanner::PatternByte],
+) -> Result<Vec<usize>> {
+    let mut found = Vec::new();
+    for region in maps.game_executable_regions() {
+        let hits = scan_pattern_chunked(region.size(), pattern, |offset, buf| {
+            match mem.read(region.start + offset, buf) {
+                Ok(()) => Ok(buf.len()),
+                Err(e) => Err(e.to_string()),
+            }
+        })
+        .map_err(TrainerError::Other)?;
+        for off in hits {
+            found.push(region.start + off);
+        }
+    }
+    Ok(found)
+}
+
 /// Locate and validate AddXP in the live process.
 pub fn locate_addxp(mem: &ProcessMemory<'_>, maps: &ProcessMaps) -> Result<ExpPatchSites> {
     let base = find_module_base(maps)?;
-    let sites = ExpPatchSites::from_module_base(base);
-
     let pattern = parse_pattern(ADDXP_PROLOGUE).map_err(TrainerError::Other)?;
     let prologue_len = pattern.len();
-    let bytes = mem.read_vec(sites.addxp, prologue_len)?;
-    let hits = scan_pattern(&bytes, &pattern);
-    if hits != [0] {
-        // Fallback: scan executable module region(s)
-        let mut found = Vec::new();
-        for region in maps.game_executable_regions() {
-            let blob = mem.read_vec(region.start, region.size())?;
-            for off in scan_pattern(&blob, &pattern) {
-                found.push(region.start + off);
-            }
-        }
+
+    let expected = ExpPatchSites::from_module_base(base);
+    let bytes = mem.read_vec(expected.addxp, prologue_len)?;
+    let sites = if scan_pattern(&bytes, &pattern) == [0] {
+        expected
+    } else {
+        let found = scan_addxp_in_executable(mem, maps, &pattern)?;
         match found.as_slice() {
-            &[addr] => {
-                let base = addr.checked_sub(ADDXP_RVA).ok_or_else(|| {
-                    TrainerError::Other("AddXP address underflow computing module base".into())
-                })?;
-                return Ok(ExpPatchSites::from_module_base(base));
-            }
+            &[addr] => ExpPatchSites::from_addxp(base, addr),
             [] => {
                 return Err(TrainerError::Other(
                     "Known EXP signature was not found.\n\
@@ -111,22 +143,9 @@ pub fn locate_addxp(mem: &ProcessMemory<'_>, maps: &ProcessMaps) -> Result<ExpPa
                 )));
             }
         }
-    }
+    };
 
-    // Confirm cave is INT3 padding (or already our cave).
-    let cave = mem.read_vec(sites.cave, CAVE_LEN)?;
-    let entry = mem.read_vec(sites.entry, 6)?;
-    let cave_ok = cave.iter().all(|&b| b == 0xCC) || looks_like_our_cave(&cave);
-    let entry_ok = entry == ENTRY_ORIGINAL || entry[0] == 0xE9;
-    if !cave_ok || !entry_ok {
-        return Err(TrainerError::Other(format!(
-            "AddXP site found at 0x{:x}, but surrounding bytes are unexpected.\n\
-             entry={:02x?} cave={:02x?}\n\
-             Refusing to write memory.",
-            sites.addxp, entry, cave
-        )));
-    }
-
+    validate_addxp_surroundings(mem, &sites)?;
     Ok(sites)
 }
 
@@ -137,19 +156,6 @@ fn looks_like_our_cave(cave: &[u8]) -> bool {
         && cave[1] == 0xD2
         && cave[3..9] == [0x44, 0x8B, 0xFA, 0x48, 0x8B, 0xF1]
         && cave[9] == 0xE9
-}
-
-fn encode_i32_le(v: i32) -> [u8; 4] {
-    v.to_le_bytes()
-}
-
-fn rel32(from_next_ip: usize, to: usize) -> Result<i32> {
-    let delta = to as isize - from_next_ip as isize;
-    i32::try_from(delta).map_err(|_| {
-        TrainerError::Other(format!(
-            "rel32 out of range: from_next=0x{from_next_ip:x} to=0x{to:x}"
-        ))
-    })
 }
 
 /// Build the entry + cave patches for a multiplier (>=2).
@@ -173,9 +179,7 @@ pub fn build_multiplier_patches(
     debug_assert_eq!(cave.len(), CAVE_LEN);
 
     let mut entry = Vec::with_capacity(6);
-    entry.push(0xE9); // jmp cave
-    let entry_jmp_from = sites.entry + 5;
-    entry.extend_from_slice(&encode_i32_le(rel32(entry_jmp_from, sites.cave)?));
+    entry.extend_from_slice(&jmp_rel(sites.entry, sites.cave)?);
     entry.push(0x90); // nop
     debug_assert_eq!(entry.len(), 6);
 
@@ -222,7 +226,6 @@ fn restore_sites(mem: &ProcessMemory<'_>, sites: &ExpPatchSites) -> Result<u32> 
     }
 
     if entry[0] == 0xE9 && cave_ours {
-        // Treat current bytes as the "replacement" so MemoryPatch::restore verifies cleanly.
         let entry_patch = MemoryPatch::new(sites.entry, ENTRY_ORIGINAL.to_vec(), entry)?;
         let cave_patch = MemoryPatch::new(sites.cave, vec![0xCC; CAVE_LEN], cave)?;
         entry_patch.restore(mem)?;
@@ -240,13 +243,16 @@ pub fn apply_multiplier(
     process: &GameProcess,
     maps: &ProcessMaps,
     multiplier: u32,
+    force_build: bool,
     verbose: bool,
 ) -> Result<u32> {
     let mult = validate_multiplier(multiplier)?;
+    let hash = assert_supported_build(maps, force_build)?;
     let mem = ProcessMemory::new(process);
     let sites = locate_addxp(&mem, maps)?;
 
     if verbose {
+        println!("Shipping.exe SHA-256: {hash}");
         println!("Module base: 0x{:x}", sites.module_base);
         println!("AddXP:       0x{:x}", sites.addxp);
         println!("Entry patch: 0x{:x}", sites.entry);
@@ -270,7 +276,6 @@ pub fn apply_multiplier(
             if current == Some(mult) {
                 return Ok(mult);
             }
-            // Cave bytes differ per multiplier; restore via known originals, then re-apply.
             restore_sites(&mem, &sites)?;
             cave_patch.apply(&mem)?;
             entry_patch.apply(&mem)?;
@@ -317,5 +322,16 @@ mod tests {
         assert_eq!(cave.replacement[0..3], [0x6B, 0xD2, 10]);
         assert_eq!(entry.replacement[0], 0xE9);
         assert_eq!(entry.replacement[5], 0x90);
+    }
+
+    #[test]
+    fn from_addxp_uses_discovered_address_not_stale_rva() {
+        let base = 0x1000_0000;
+        let moved = base + ADDXP_RVA + 0x1000;
+        let sites = ExpPatchSites::from_addxp(base, moved);
+        assert_eq!(sites.module_base, base);
+        assert_eq!(sites.addxp, moved);
+        assert_eq!(sites.entry, moved + ENTRY_PATCH_OFFSET);
+        assert_eq!(sites.cave, moved + CAVE_OFFSET);
     }
 }

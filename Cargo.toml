@@ -2,6 +2,7 @@
 name = "tq2-trainer"
 version = "1.0.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Linux-native Titan Quest II trainer (EXP + gold; single-player / offline)"
 license = "MIT"
 readme = "README.md"
@@ -16,6 +17,7 @@ exclude = ["research-dumps/*"]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+sha2 = "0.10"
 thiserror = "2"
 
 [profile.release]

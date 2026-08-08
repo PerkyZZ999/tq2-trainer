@@ -2,7 +2,6 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, Seek, SeekFrom, Write};
-use std::mem;
 use std::path::PathBuf;
 
 use libc::{c_void, iovec, process_vm_readv};
@@ -125,11 +124,6 @@ impl<'a> ProcessMemory<'a> {
         self.read(address, &mut buf)?;
         Ok(buf)
     }
-}
-
-#[allow(dead_code)]
-fn _iovec_size_check() {
-    let _ = mem::size_of::<iovec>();
 }
 
 #[cfg(test)]

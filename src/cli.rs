@@ -18,6 +18,10 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub verbose: bool,
 
+    /// Skip Shipping.exe SHA-256 build check (unsafe; for research only).
+    #[arg(long, global = true)]
+    pub force: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -39,8 +43,9 @@ pub enum Commands {
     /// Restore original EXP behavior (same as `xp 1`).
     Restore,
 
-    /// EXPERIMENTAL / UNSAFE: one-shot gold via GetGold trampoline (can crash the game).
-    /// Prefer `sell-gold` for a validated wallet grant.
+    /// EXPERIMENTAL / UNSAFE: one-shot gold via GetGold trampoline (hidden; can crash).
+    /// Prefer `sell-gold`. Requires `--unsafe-grant`.
+    #[command(hide = true)]
     Gold {
         /// Amount of gold to add (must be positive).
         amount: i64,

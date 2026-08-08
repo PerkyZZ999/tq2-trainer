@@ -44,6 +44,53 @@ pub fn scan_pattern(haystack: &[u8], pattern: &[PatternByte]) -> Vec<usize> {
     hits
 }
 
+/// Chunk size for scanning large executable mappings without loading them whole.
+pub const SCAN_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Scan a logical region in overlapping chunks via a read callback.
+///
+/// `read(offset, buf) -> bytes_read` fills `buf` from the logical region starting at `offset`.
+/// Overlap is `pattern.len().saturating_sub(1)` so matches spanning chunk edges are not missed.
+pub fn scan_pattern_chunked<F>(
+    region_size: usize,
+    pattern: &[PatternByte],
+    mut read: F,
+) -> Result<Vec<usize>, String>
+where
+    F: FnMut(usize, &mut [u8]) -> Result<usize, String>,
+{
+    if pattern.is_empty() || region_size < pattern.len() {
+        return Ok(Vec::new());
+    }
+
+    let overlap = pattern.len().saturating_sub(1);
+    let mut hits = Vec::new();
+    let mut offset = 0usize;
+    let mut chunk = vec![0u8; SCAN_CHUNK_SIZE.min(region_size)];
+
+    while offset < region_size {
+        let len = (region_size - offset).min(chunk.len());
+        let n = read(offset, &mut chunk[..len])?;
+        if n == 0 {
+            break;
+        }
+        for rel in scan_pattern(&chunk[..n], pattern) {
+            hits.push(offset + rel);
+        }
+        if offset + n >= region_size {
+            break;
+        }
+        offset += n.saturating_sub(overlap);
+        if n <= overlap {
+            break;
+        }
+    }
+
+    hits.sort_unstable();
+    hits.dedup();
+    Ok(hits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,5 +112,22 @@ mod tests {
         ];
         mem[10..10 + bytes.len()].copy_from_slice(&bytes);
         assert_eq!(scan_pattern(&mem, &pat), vec![10]);
+    }
+
+    #[test]
+    fn chunked_scan_finds_pattern_across_chunk_edge() {
+        let pat = parse_pattern("DE AD BE EF").unwrap();
+        let mut region = vec![0u8; SCAN_CHUNK_SIZE + 8];
+        let start = SCAN_CHUNK_SIZE - 2;
+        region[start..start + 4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let hits = scan_pattern_chunked(region.len(), &pat, |off, buf| {
+            let end = (off + buf.len()).min(region.len());
+            let n = end - off;
+            buf[..n].copy_from_slice(&region[off..end]);
+            Ok(n)
+        })
+        .unwrap();
+        assert_eq!(hits, vec![start]);
     }
 }

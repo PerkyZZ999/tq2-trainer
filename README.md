@@ -56,6 +56,7 @@ sudo setcap cap_sys_ptrace=ep target/release/tq2-trainer
 | `scan` | List Shipping.exe memory mappings (diagnostics) |
 | `research --target exp\|gold …` | Collaborative value scan (`snap` / `narrow` / `list` / `probe`) |
 | `-v …` | Verbose details (bases, patch sites, etc.) |
+| `--force` | Skip Shipping.exe SHA-256 check (unsafe / research only) |
 
 Examples:
 
@@ -69,8 +70,7 @@ Examples:
 # … sell exactly one item …
 ```
 
-> **Note:** There is an experimental `gold` free-grant command gated behind `--unsafe-grant`. It crashed in live testing — prefer `sell-gold`.
-
+Writes refuse unknown Shipping.exe hashes (see supported build table). Re-run `setcap` after rebuilds.
 ## Process access (ptrace / Yama)
 
 With `kernel.yama.ptrace_scope=1`, unrelated processes may be denied `process_vm_readv` / `/proc/<pid>/mem`.
@@ -123,6 +123,7 @@ research-dumps/ Local scan artifacts (gitignored; created on demand)
 - Not affiliated with, endorsed by, or related to the Titan Quest II developers or publishers.
 - Game updates may invalidate signatures; unsupported builds are refused.
 - Back up important saves before patching.
+- Prefer save backups. Don’t leave a world-writable `setcap` binary around — `cap_sys_ptrace` can read/write other processes you own.
 - Restarting the game clears live patches; re-run `xp` / `sell-gold` after launch if needed.
 - You are responsible for complying with the game’s Terms of Service and applicable law.
 

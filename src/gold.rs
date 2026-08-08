@@ -8,11 +8,13 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Result, TrainerError};
 use crate::exp::find_module_base;
+use crate::fingerprint::assert_supported_build;
 use crate::maps::ProcessMaps;
 use crate::memory::ProcessMemory;
 use crate::patch::{MemoryPatch, PatchState};
 use crate::process::GameProcess;
 use crate::research::{CandidateSet, ResearchKind, ValueHit, filter_live, read_hit, snap_value};
+use crate::x86::{call_rel, encode_i32_le, jmp_rel};
 
 /// SellItem payout load site: `mov r9d, [rsp+0x58]` before inventory-add.
 pub const SELL_PAYOUT_RVA: usize = 0x6D_21FE3;
@@ -96,33 +98,6 @@ pub fn locate_gold_sites(mem: &ProcessMemory<'_>, maps: &ProcessMaps) -> Result<
     }
 
     Ok(sites)
-}
-
-fn encode_i32_le(v: i32) -> [u8; 4] {
-    v.to_le_bytes()
-}
-
-fn rel32(from_next_ip: usize, to: usize) -> Result<i32> {
-    let delta = to as isize - from_next_ip as isize;
-    i32::try_from(delta).map_err(|_| {
-        TrainerError::Other(format!(
-            "rel32 out of range: from_next=0x{from_next_ip:x} to=0x{to:x}"
-        ))
-    })
-}
-
-fn call_rel(from: usize, target: usize) -> Result<[u8; 5]> {
-    let mut out = [0u8; 5];
-    out[0] = 0xE8;
-    out[1..].copy_from_slice(&encode_i32_le(rel32(from + 5, target)?));
-    Ok(out)
-}
-
-fn jmp_rel(from: usize, target: usize) -> Result<[u8; 5]> {
-    let mut out = [0u8; 5];
-    out[0] = 0xE9;
-    out[1..].copy_from_slice(&encode_i32_le(rel32(from + 5, target)?));
-    Ok(out)
 }
 
 pub fn validate_gold_amount(amount: i64) -> Result<i32> {
@@ -283,36 +258,41 @@ fn wait_for_balance(
     timeout: Duration,
 ) -> Result<usize> {
     let mem = ProcessMemory::new(process);
+    // Only watch addresses that currently hold `before` — stray `after` hits are not a grant.
+    let watchers: Vec<&ValueHit> = hits
+        .iter()
+        .filter(|h| read_hit(&mem, h).ok() == Some(before))
+        .collect();
+    if watchers.is_empty() {
+        return Err(TrainerError::Other(format!(
+            "no live gold mirrors currently hold {before}; pass an exact --current value"
+        )));
+    }
+
+    let need = 1;
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         process.ensure_alive()?;
-        let mut at_after = 0usize;
-        let mut still_before = 0usize;
-        for hit in hits {
+        let mut transitioned = 0usize;
+        for hit in &watchers {
             match read_hit(&mem, hit) {
-                Ok(v) if v == after => at_after += 1,
-                Ok(v) if v == before => still_before += 1,
+                Ok(v) if v == after => transitioned += 1,
                 Ok(_)
                 | Err(TrainerError::MemoryRead { .. })
                 | Err(TrainerError::PermissionDenied) => {}
                 Err(e) => return Err(e),
             }
         }
-
-        // Prefer several confirmations when available.
-        if at_after >= 3 || (at_after > 0 && at_after == hits.len()) {
-            return Ok(at_after);
+        // A watched mirror that held `before` at arm-time and now holds `after` is enough.
+        // (Most snap hits are sticky caches; requiring 2+ transitions timed out on real sales.)
+        if transitioned >= need {
+            return Ok(transitioned);
         }
-        // Currencies UI often updates only 1–2 mirrors; most snap hits are sticky caches
-        // that stay at `before`. One live `after` alongside leftovers is enough.
-        if at_after >= 1 && still_before > 0 {
-            return Ok(at_after);
-        }
-
         thread::sleep(POLL_INTERVAL);
     }
     Err(TrainerError::Other(format!(
-        "timed out after {}s waiting for gold {before} -> {after}",
+        "timed out after {}s waiting for gold {before} -> {after} \
+         (need a watched mirror to update; run `sell-gold --disarm` if still armed)",
         timeout.as_secs()
     )))
 }
@@ -325,21 +305,30 @@ pub struct SellGoldResult {
     pub armed_only: bool,
 }
 
+/// Options for [`arm_sell_gold`].
+#[derive(Debug, Clone)]
+pub struct SellGoldOptions {
+    pub amount: i64,
+    pub current: Option<i64>,
+    pub timeout: Duration,
+    pub no_wait: bool,
+    pub force_build: bool,
+    pub verbose: bool,
+}
+
 /// Arm next-sale gold payout. By default waits for the sale, then restores.
 pub fn arm_sell_gold(
     process: &GameProcess,
     maps: &ProcessMaps,
-    amount: i64,
-    current: Option<i64>,
-    timeout: Duration,
-    no_wait: bool,
-    verbose: bool,
+    opts: &SellGoldOptions,
 ) -> Result<SellGoldResult> {
-    let amount = validate_gold_amount(amount)?;
+    let amount = validate_gold_amount(opts.amount)?;
+    let hash = assert_supported_build(maps, opts.force_build)?;
     let mem = ProcessMemory::new(process);
     let sites = locate_gold_sites(&mem, maps)?;
 
-    if verbose {
+    if opts.verbose {
+        println!("Shipping.exe SHA-256: {hash}");
         println!("Sell payout site: 0x{:x}", sites.sell_entry);
         println!("Sell cave:        0x{:x}", sites.sell_cave);
     }
@@ -353,23 +342,22 @@ pub fn arm_sell_gold(
     }
     entry_patch.apply(&mem)?;
 
-    if no_wait {
+    if opts.no_wait {
         return Ok(SellGoldResult {
             amount,
-            before: current,
+            before: opts.current,
             after: None,
             armed_only: true,
         });
     }
 
-    let (before, hits) = locate_balance_mirrors(process, maps, current, verbose)?;
+    let (before, hits) = locate_balance_mirrors(process, maps, opts.current, opts.verbose)?;
     let after = before
         .checked_add(i64::from(amount))
         .ok_or_else(|| TrainerError::Other("gold add overflow".into()))?;
 
-    match wait_for_balance(process, before, after, &hits, timeout) {
+    match wait_for_balance(process, before, after, &hits, opts.timeout) {
         Ok(_) => {
-            // Let the grant settle, then restore so later sales are normal.
             thread::sleep(Duration::from_millis(150));
             restore_sell_sites(&mem, &sites)?;
             let path = ResearchKind::Gold.path();
@@ -390,7 +378,12 @@ pub fn arm_sell_gold(
             })
         }
         Err(e) => {
-            let _ = restore_sell_sites(&mem, &sites);
+            if let Err(restore_err) = restore_sell_sites(&mem, &sites) {
+                return Err(TrainerError::Other(format!(
+                    "{e}\nAlso failed to restore sell-gold patch: {restore_err}\n\
+                     Run `tq2-trainer sell-gold --disarm` immediately."
+                )));
+            }
             Err(e)
         }
     }
@@ -591,6 +584,16 @@ pub struct GoldAddResult {
     pub after: i64,
 }
 
+/// Options for [`add_gold`].
+#[derive(Debug, Clone)]
+pub struct GoldAddOptions {
+    pub amount: i64,
+    pub current: Option<i64>,
+    pub timeout: Duration,
+    pub force_build: bool,
+    pub verbose: bool,
+}
+
 /// One-shot wallet grant via a temporary GetGold trampoline.
 ///
 /// Open the Currencies / inventory UI (or otherwise cause GetGold to run) while
@@ -598,16 +601,14 @@ pub struct GoldAddResult {
 pub fn add_gold(
     process: &GameProcess,
     maps: &ProcessMaps,
-    amount: i64,
-    current: Option<i64>,
-    timeout: Duration,
-    verbose: bool,
+    opts: &GoldAddOptions,
 ) -> Result<GoldAddResult> {
-    let amount = validate_gold_amount(amount)?;
+    let amount = validate_gold_amount(opts.amount)?;
+    let hash = assert_supported_build(maps, opts.force_build)?;
     let mem = ProcessMemory::new(process);
     let sites = locate_gold_sites(&mem, maps)?;
 
-    let (before, hits) = locate_balance_mirrors(process, maps, current, verbose)?;
+    let (before, hits) = locate_balance_mirrors(process, maps, opts.current, opts.verbose)?;
     let after = before
         .checked_add(i64::from(amount))
         .ok_or_else(|| TrainerError::Other("gold add overflow".into()))?;
@@ -618,7 +619,8 @@ pub fn add_gold(
     // Ensure clean slate.
     restore_one_shot_sites(&mem, &sites, cave_len)?;
 
-    if verbose {
+    if opts.verbose {
+        println!("Shipping.exe SHA-256: {hash}");
         println!("GetGold hook: 0x{:x}", sites.getgold_hook);
         println!("Gold cave:    0x{:x} ({cave_len} bytes)", sites.gold_cave);
         println!("Target: {before} -> {after}");
@@ -650,7 +652,7 @@ pub fn add_gold(
         }
     }
 
-    match wait_for_balance(process, before, after, &hits, timeout) {
+    match wait_for_balance(process, before, after, &hits, opts.timeout) {
         Ok(_) => {
             thread::sleep(Duration::from_millis(150));
             restore_one_shot_sites(&mem, &sites, cave_len)?;
@@ -671,7 +673,11 @@ pub fn add_gold(
             })
         }
         Err(e) => {
-            let _ = restore_one_shot_sites(&mem, &sites, cave_len);
+            if let Err(restore_err) = restore_one_shot_sites(&mem, &sites, cave_len) {
+                return Err(TrainerError::Other(format!(
+                    "{e}\nAlso failed to restore GetGold patch: {restore_err}"
+                )));
+            }
             Err(e)
         }
     }
@@ -729,11 +735,5 @@ mod tests {
         // Contains call opcodes to construct / validate / add.
         assert!(cave.replacement.contains(&0xE8));
         assert_eq!(cave.replacement[0], 0x57); // push rdi
-    }
-
-    #[test]
-    fn value_width_label_still_available_for_status() {
-        use crate::research::ValueWidth;
-        assert_eq!(ValueWidth::I32.as_str(), "i32");
     }
 }
