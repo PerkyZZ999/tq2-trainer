@@ -1,6 +1,6 @@
-# Titan Quest II Native EXP Trainer
+# Titan Quest II Native Trainer
 
-Linux-native Rust CLI for Titan Quest II (Steam + Proton). Applies a reversible **experience multiplier** by patching the live `AddXP` function — no Wine trainer, no injection framework.
+Linux-native Rust CLI for Titan Quest II (Steam + Proton). Applies a reversible **experience multiplier** by patching the live `AddXP` function, and can force the next item sale's gold payout via `sell-gold` — no Wine trainer, no injection framework.
 
 **Single-player / offline personal use only.**
 
@@ -19,7 +19,7 @@ sudo setcap cap_sys_ptrace=ep target/release/tq2-trainer
 ./target/release/tq2-trainer restore
 ```
 
-Presets: **`1`** (original), **`2`**, **`3`**, **`5`**, **`10`**.
+EXP presets: **`1`** (original), **`2`**, **`3`**, **`5`**, **`10`**.
 
 ## Daily commands
 
@@ -28,7 +28,11 @@ Presets: **`1`** (original), **`2`**, **`3`**, **`5`**, **`10`**.
 | `status` | Find the game, check build support, show current multiplier |
 | `xp <n>` | Apply multiplier (`1` restores original) |
 | `restore` | Same as `xp 1` |
+| `sell-gold <n> [--current <g>]` | Next sold item pays `n` gold, then auto-restores |
+| `sell-gold --disarm` | Cancel an armed sell-gold override |
+| `gold <n> --unsafe-grant …` | Experimental free grant (can crash — prefer `sell-gold`) |
 | `scan` | List Shipping.exe memory mappings (diagnostics) |
+| `research --target exp\|gold …` | Collaborative value scan (`snap` / `narrow` / `list` / `probe`) |
 | `-v …` | Verbose details (bases, patch sites, etc.) |
 
 Examples:
@@ -37,6 +41,10 @@ Examples:
 ./target/release/tq2-trainer xp 5
 ./target/release/tq2-trainer -v status
 ./target/release/tq2-trainer restore
+
+# Next sale pays exactly 50000 gold (pass --current so it can detect + restore):
+./target/release/tq2-trainer sell-gold 50000 --current 58098
+# … sell one item …
 ```
 
 ## Requirements
@@ -68,7 +76,9 @@ The trainer does **not** change that sysctl. If you see a permission error:
 
 ## After a game update
 
-If `status` reports an unsupported build, the AddXP signature no longer matches. See [`docs/EXP-PATCH.md`](docs/EXP-PATCH.md) for the patch recipe and [`docs/RESEARCH.md`](docs/RESEARCH.md) for rediscovery notes. The built-in `research snap|narrow|list` helpers can help isolate live EXP values again.
+If `status` reports an unsupported build, the AddXP signature no longer matches. See [`docs/EXP-PATCH.md`](docs/EXP-PATCH.md) for the patch recipe and [`docs/RESEARCH.md`](docs/RESEARCH.md) for rediscovery notes. The built-in `research --target exp snap|narrow|list` helpers can help isolate live EXP values again.
+
+Gold uses a temporary SellItem payout patch (same build fingerprint as EXP). Pass `--current <on-screen gold>` so the trainer can detect the grant and restore. Value-scan `research --target gold probe` only writes memory mirrors — it does **not** update the Currencies UI. The experimental `gold` free-grant path requires `--unsafe-grant` and can crash. See [`docs/GOLD-RESEARCH.md`](docs/GOLD-RESEARCH.md).
 
 ## Develop
 

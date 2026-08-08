@@ -3,6 +3,7 @@
 mod cli;
 mod error;
 mod exp;
+mod gold;
 mod maps;
 mod memory;
 mod patch;
@@ -13,12 +14,20 @@ mod scanner;
 use anyhow::Context;
 use clap::Parser;
 
-use crate::cli::{Cli, Commands, ResearchAction};
+use std::time::Duration;
+
+use crate::cli::{Cli, Commands, ResearchAction, ResearchTarget};
 use crate::exp::{apply_multiplier, detect_multiplier, find_module_base, locate_addxp};
+use crate::gold::{
+    add_gold, arm_sell_gold, default_wait_timeout, disarm_sell_gold, locate_gold_sites,
+    sell_gold_is_armed,
+};
 use crate::maps::{format_game_module_summary, read_maps};
 use crate::memory::ProcessMemory;
 use crate::process::{GAME_EXE_NAME, find_game_process};
-use crate::research::{CandidateSet, format_candidates, narrow_value, snap_value};
+use crate::research::{
+    CandidateSet, ResearchKind, format_candidates_for, narrow_value, probe_write, snap_value,
+};
 
 fn main() {
     if let Err(err) = run() {
@@ -33,12 +42,32 @@ fn run() -> anyhow::Result<()> {
     match cli.command {
         Commands::Status => cmd_status(cli.verbose)?,
         Commands::Scan => cmd_scan(cli.verbose)?,
-        Commands::Research { action } => cmd_research(action, cli.verbose)?,
+        Commands::Research { target, action } => cmd_research(target, action, cli.verbose)?,
         Commands::Xp { multiplier } => cmd_xp(multiplier, cli.verbose)?,
         Commands::Restore => cmd_xp(1, cli.verbose)?,
+        Commands::Gold {
+            amount,
+            current,
+            timeout,
+            unsafe_grant,
+        } => cmd_gold(amount, current, timeout, unsafe_grant, cli.verbose)?,
+        Commands::SellGold {
+            amount,
+            current,
+            timeout,
+            no_wait,
+            disarm,
+        } => cmd_sell_gold(amount, current, timeout, no_wait, disarm, cli.verbose)?,
     }
 
     Ok(())
+}
+
+fn research_kind(target: ResearchTarget) -> ResearchKind {
+    match target {
+        ResearchTarget::Exp => ResearchKind::Exp,
+        ResearchTarget::Gold => ResearchKind::Gold,
+    }
 }
 
 fn cmd_status(verbose: bool) -> anyhow::Result<()> {
@@ -116,6 +145,49 @@ fn cmd_status(verbose: bool) -> anyhow::Result<()> {
         }
     }
 
+    match locate_gold_sites(&mem, &maps) {
+        Ok(sites) => {
+            println!("Gold sites: supported");
+            match sell_gold_is_armed(&mem, &sites) {
+                Ok(true) => println!("sell-gold: ARMED (next sale payout overridden)"),
+                Ok(false) => println!("sell-gold: idle"),
+                Err(_) => println!("sell-gold: unknown"),
+            }
+            if verbose {
+                println!("Sell payout: 0x{:x}", sites.sell_entry);
+                println!("GetGold:     0x{:x}", sites.getgold);
+            }
+        }
+        Err(e) => {
+            println!("Gold sites: unsupported / signature miss");
+            if verbose {
+                println!("Detail: {e}");
+            }
+        }
+    }
+
+    let gold_path = ResearchKind::Gold.path();
+    if gold_path.exists() {
+        match CandidateSet::load(&gold_path) {
+            Ok(set) if set.pid == game.pid => {
+                println!(
+                    "Gold mirrors: {} candidate(s) for this PID (last value {})",
+                    set.hits.len(),
+                    set.last_value
+                );
+            }
+            Ok(set) => {
+                println!(
+                    "Gold mirrors: candidate file is for PID {} (game is {}) — re-snap",
+                    set.pid, game.pid
+                );
+            }
+            Err(_) => println!("Gold mirrors: candidate file unreadable"),
+        }
+    } else {
+        println!("Gold mirrors: none yet (optional; used to detect grants)");
+    }
+
     Ok(())
 }
 
@@ -189,15 +261,120 @@ fn cmd_xp(multiplier: u32, verbose: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_research(action: ResearchAction, verbose: bool) -> anyhow::Result<()> {
-    let path = CandidateSet::default_path();
+fn cmd_gold(
+    amount: i64,
+    current: Option<i64>,
+    timeout_secs: u64,
+    unsafe_grant: bool,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    if !unsafe_grant {
+        anyhow::bail!(
+            "gold is experimental and crashed the game in live testing — prefer `sell-gold`. \
+             Re-run with --unsafe-grant only if you accept that risk (save first)."
+        );
+    }
+
+    let game = find_game_process().context("process discovery")?;
+    let maps = read_maps(&game).context("reading memory maps")?;
+    let timeout = if timeout_secs == 0 {
+        default_wait_timeout()
+    } else {
+        Duration::from_secs(timeout_secs)
+    };
+
+    println!("Titan Quest II found");
+    println!("PID: {}", game.pid);
+    println!("Arming UNSAFE one-shot gold grant (+{amount})...");
+    println!("Open Currencies / inventory (so GetGold runs), then wait.");
+
+    let result = add_gold(&game, &maps, amount, current, timeout, verbose).context("add gold")?;
+
+    println!(
+        "Gold: {} -> {} (+{})",
+        result.before, result.after, result.amount
+    );
+    println!("Done. Patch restored.");
+    Ok(())
+}
+
+fn cmd_sell_gold(
+    amount: Option<i64>,
+    current: Option<i64>,
+    timeout_secs: u64,
+    no_wait: bool,
+    disarm: bool,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    let game = find_game_process().context("process discovery")?;
+    let maps = read_maps(&game).context("reading memory maps")?;
+
+    println!("Titan Quest II found");
+    println!("PID: {}", game.pid);
+
+    if disarm {
+        disarm_sell_gold(&game, &maps, verbose).context("disarm sell-gold")?;
+        println!("sell-gold disarmed (original payout restored).");
+        return Ok(());
+    }
+
+    let Some(amount) = amount else {
+        anyhow::bail!("sell-gold requires <amount>, or pass --disarm");
+    };
+
+    let timeout = if timeout_secs == 0 {
+        default_wait_timeout()
+    } else {
+        Duration::from_secs(timeout_secs)
+    };
+
+    if no_wait {
+        println!("Arming sell-gold (+{amount}) without waiting...");
+    } else {
+        println!("Arming sell-gold (+{amount})...");
+        println!(
+            "Sell exactly one item now. Waiting up to {}s...",
+            timeout.as_secs()
+        );
+    }
+
+    let result = arm_sell_gold(&game, &maps, amount, current, timeout, no_wait, verbose)
+        .context("sell-gold")?;
+
+    if result.armed_only {
+        println!(
+            "Armed: next sold item pays {} gold. Run `sell-gold --disarm` to cancel.",
+            result.amount
+        );
+    } else {
+        println!(
+            "Gold: {} -> {} (sale payout forced to +{})",
+            result.before.unwrap_or(-1),
+            result.after.unwrap_or(-1),
+            result.amount
+        );
+        println!("Done. Patch restored.");
+    }
+    Ok(())
+}
+
+fn cmd_research(
+    target: ResearchTarget,
+    action: ResearchAction,
+    verbose: bool,
+) -> anyhow::Result<()> {
+    let kind = research_kind(target);
+    let path = kind.path();
+    let label = kind.label();
 
     match action {
         ResearchAction::Snap { value } => {
             let game = find_game_process().context("process discovery")?;
             println!("Titan Quest II found (PID {})", game.pid);
-            println!("Snapping exact value {value} (i32 + i64, writable private memory)...");
-            println!("Stay in-game; do not gain EXP until this finishes.");
+            println!(
+                "Snapping exact {label} value {value} (i32 + i64, writable private memory)..."
+            );
+            println!("Stay in-game; do not change {label} until this finishes.");
 
             let maps = read_maps(&game).context("reading memory maps")?;
             if verbose {
@@ -211,9 +388,10 @@ fn cmd_research(action: ResearchAction, verbose: bool) -> anyhow::Result<()> {
             }
 
             let set = snap_value(&game, &maps, value).context("snap scan")?;
-            set.save(&path).context("saving candidates")?;
+            set.save_labeled(&path, label)
+                .context("saving candidates")?;
             println!();
-            print!("{}", format_candidates(&set));
+            print!("{}", format_candidates_for(&set, label));
             println!("Saved: {}", path.display());
         }
         ResearchAction::Narrow { value } => {
@@ -221,20 +399,57 @@ fn cmd_research(action: ResearchAction, verbose: bool) -> anyhow::Result<()> {
             let previous = CandidateSet::load(&path).context("loading previous candidates")?;
             println!("Titan Quest II found (PID {})", game.pid);
             println!(
-                "Narrowing {} candidates -> value {value} ...",
+                "Narrowing {} {label} candidates -> value {value} ...",
                 previous.hits.len()
             );
 
             let set = narrow_value(&game, &previous, value).context("narrow")?;
-            set.save(&path).context("saving candidates")?;
+            set.save_labeled(&path, label)
+                .context("saving candidates")?;
             println!();
-            print!("{}", format_candidates(&set));
+            print!("{}", format_candidates_for(&set, label));
             println!("Saved: {}", path.display());
         }
         ResearchAction::List => {
             let set = CandidateSet::load(&path).context("loading candidates")?;
-            print!("{}", format_candidates(&set));
+            print!("{}", format_candidates_for(&set, label));
             println!("File: {}", path.display());
+        }
+        ResearchAction::Probe { value } => {
+            let game = find_game_process().context("process discovery")?;
+            let previous = CandidateSet::load(&path).context("loading previous candidates")?;
+            println!("Titan Quest II found (PID {})", game.pid);
+            println!(
+                "Probe write: unique {label} candidate {} -> {value} ...",
+                previous.last_value
+            );
+
+            let hit =
+                probe_write(&game, &previous, previous.last_value, value).context("probe write")?;
+            let updated = CandidateSet {
+                pid: game.pid,
+                last_value: value,
+                hits: vec![hit.clone()],
+            };
+            updated
+                .save_labeled(&path, label)
+                .context("saving candidates")?;
+
+            if matches!(kind, ResearchKind::Gold) {
+                println!(
+                    "Wrote {value} at 0x{:x} ({}) — memory mirror only; Currencies UI will NOT update.",
+                    hit.address,
+                    hit.width.as_str()
+                );
+                println!("Use `gold` / `sell-gold` for real wallet grants.");
+            } else {
+                println!(
+                    "Wrote {value} at 0x{:x} ({}) — confirm the in-game {label} UI.",
+                    hit.address,
+                    hit.width.as_str()
+                );
+            }
+            println!("Saved: {}", path.display());
         }
     }
 

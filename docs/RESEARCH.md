@@ -32,15 +32,17 @@ Historical notes from the 2026-08 discovery session. Day-to-day usage lives in t
 If you need to rediscover live EXP addresses after an update:
 
 ```bash
-./target/release/tq2-trainer research snap <current_exp>
+./target/release/tq2-trainer research --target exp snap <current_exp>
 # gain some EXP in-game
-./target/release/tq2-trainer research narrow <new_exp>
-./target/release/tq2-trainer research list
+./target/release/tq2-trainer research --target exp narrow <new_exp>
+./target/release/tq2-trainer research --target exp list
 ```
 
-Candidates are written to `research-dumps/exp-candidates.txt` (gitignored).
+Candidates are written to `research-dumps/exp-candidates.txt` (gitignored). Default `--target` is `exp` if omitted.
 
 Prefer re-finding **AddXP** for the multiplier (see EXP-PATCH.md) over chasing relocating data values.
+
+For gold one-shot adds, use `--target gold` and see [GOLD-RESEARCH.md](GOLD-RESEARCH.md).
 
 ## Archive
 

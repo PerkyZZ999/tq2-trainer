@@ -1,4 +1,4 @@
-//! Collaborative read-only EXP value research (snap / narrow / list).
+//! Collaborative value research (snap / narrow / list / probe).
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -10,11 +10,35 @@ use crate::maps::{MemoryRegion, ProcessMaps};
 use crate::memory::ProcessMemory;
 use crate::process::GameProcess;
 
-const DEFAULT_STATE_PATH: &str = "research-dumps/exp-candidates.txt";
+const EXP_STATE_PATH: &str = "research-dumps/exp-candidates.txt";
+const GOLD_STATE_PATH: &str = "research-dumps/gold-candidates.txt";
 const CHUNK_SIZE: usize = 1024 * 1024;
 const MAX_LIST: usize = 64;
 
-/// Integer width for an EXP candidate hit.
+/// Which on-disk candidate set to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResearchKind {
+    Exp,
+    Gold,
+}
+
+impl ResearchKind {
+    pub fn path(self) -> PathBuf {
+        PathBuf::from(match self {
+            Self::Exp => EXP_STATE_PATH,
+            Self::Gold => GOLD_STATE_PATH,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Exp => "EXP",
+            Self::Gold => "gold",
+        }
+    }
+}
+
+/// Integer width for a value candidate hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueWidth {
     I32,
@@ -38,7 +62,7 @@ impl ValueWidth {
     }
 }
 
-/// One address that currently holds the searched EXP-like value.
+/// One address that currently holds the searched value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueHit {
     pub address: usize,
@@ -54,17 +78,13 @@ pub struct CandidateSet {
 }
 
 impl CandidateSet {
-    pub fn default_path() -> PathBuf {
-        PathBuf::from(DEFAULT_STATE_PATH)
-    }
-
-    pub fn save(&self, path: &Path) -> Result<()> {
+    pub fn save_labeled(&self, path: &Path, kind_label: &str) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| TrainerError::io(parent, e))?;
         }
 
         let mut file = File::create(path).map_err(|e| TrainerError::io(path, e))?;
-        writeln!(file, "# tq2-trainer EXP research candidates (read-only)")
+        writeln!(file, "# tq2-trainer {kind_label} research candidates")
             .map_err(|e| TrainerError::io(path, e))?;
         writeln!(file, "pid {}", self.pid).map_err(|e| TrainerError::io(path, e))?;
         writeln!(file, "value {}", self.last_value).map_err(|e| TrainerError::io(path, e))?;
@@ -142,7 +162,7 @@ fn parse_address(s: &str) -> Option<usize> {
     usize::from_str_radix(s, 16).ok()
 }
 
-/// Initial whole-process scan for an exact EXP value (i32 + i64 LE).
+/// Initial whole-process scan for an exact value (i32 + i64 LE).
 pub fn snap_value(process: &GameProcess, maps: &ProcessMaps, value: i64) -> Result<CandidateSet> {
     let mem = ProcessMemory::new(process);
     let regions = scannable_regions(maps);
@@ -206,7 +226,79 @@ pub fn narrow_value(
     })
 }
 
-fn address_holds(mem: &ProcessMemory<'_>, hit: &ValueHit, value: i64) -> Result<bool> {
+/// Keep hits whose live value still equals `value` (same as narrow, shared name).
+pub fn filter_live(
+    process: &GameProcess,
+    previous: &CandidateSet,
+    value: i64,
+) -> Result<CandidateSet> {
+    narrow_value(process, previous, value)
+}
+
+/// Read the integer currently stored at a hit.
+pub fn read_hit(mem: &ProcessMemory<'_>, hit: &ValueHit) -> Result<i64> {
+    match hit.width {
+        ValueWidth::I32 => {
+            let mut buf = [0u8; 4];
+            mem.read(hit.address, &mut buf)?;
+            Ok(i32::from_le_bytes(buf) as i64)
+        }
+        ValueWidth::I64 => {
+            let mut buf = [0u8; 8];
+            mem.read(hit.address, &mut buf)?;
+            Ok(i64::from_le_bytes(buf))
+        }
+    }
+}
+
+/// Write an absolute integer to a hit and verify readback.
+pub fn write_hit(mem: &ProcessMemory<'_>, hit: &ValueHit, value: i64) -> Result<()> {
+    match hit.width {
+        ValueWidth::I32 => {
+            if value < i32::MIN as i64 || value > i32::MAX as i64 {
+                return Err(TrainerError::Other(format!(
+                    "value {value} does not fit in i32 at 0x{:x}",
+                    hit.address
+                )));
+            }
+            let bytes = (value as i32).to_le_bytes();
+            mem.write_verified(hit.address, &bytes)?;
+        }
+        ValueWidth::I64 => {
+            let bytes = value.to_le_bytes();
+            mem.write_verified(hit.address, &bytes)?;
+        }
+    }
+    Ok(())
+}
+
+/// Guarded probe: require exactly one candidate that still holds `expected`, then write `new_value`.
+pub fn probe_write(
+    process: &GameProcess,
+    set: &CandidateSet,
+    expected: i64,
+    new_value: i64,
+) -> Result<ValueHit> {
+    let live = filter_live(process, set, expected)?;
+    if live.hits.is_empty() {
+        return Err(TrainerError::Other(
+            "no candidates still hold the expected value — re-snap / narrow first".into(),
+        ));
+    }
+    if live.hits.len() > 1 {
+        return Err(TrainerError::Other(format!(
+            "refusing probe write: {} candidates still match (need exactly 1) — narrow further",
+            live.hits.len()
+        )));
+    }
+
+    let hit = live.hits[0].clone();
+    let mem = ProcessMemory::new(process);
+    write_hit(&mem, &hit, new_value)?;
+    Ok(hit)
+}
+
+pub fn address_holds(mem: &ProcessMemory<'_>, hit: &ValueHit, value: i64) -> Result<bool> {
     match hit.width {
         ValueWidth::I32 => {
             if value < i32::MIN as i64 || value > i32::MAX as i64 {
@@ -314,7 +406,7 @@ fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
 }
 
 /// Print a concise candidate summary.
-pub fn format_candidates(set: &CandidateSet) -> String {
+pub fn format_candidates_for(set: &CandidateSet, kind_label: &str) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "PID {} | last value {} | {} candidates\n",
@@ -336,7 +428,9 @@ pub fn format_candidates(set: &CandidateSet) -> String {
     out.push_str(&format!("  i32: {i32_count}  i64: {i64_count}\n"));
 
     if set.hits.is_empty() {
-        out.push_str("  (none — try a fresh snap, or confirm the on-screen EXP value)\n");
+        out.push_str(&format!(
+            "  (none — try a fresh snap, or confirm the on-screen {kind_label})\n"
+        ));
         return out;
     }
 
@@ -372,6 +466,12 @@ mod tests {
     }
 
     #[test]
+    fn research_kind_paths() {
+        assert!(ResearchKind::Exp.path().ends_with("exp-candidates.txt"));
+        assert!(ResearchKind::Gold.path().ends_with("gold-candidates.txt"));
+    }
+
+    #[test]
     fn candidate_set_roundtrip() {
         let dir = std::env::temp_dir().join(format!("tq2-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -390,7 +490,7 @@ mod tests {
                 },
             ],
         };
-        set.save(&path).unwrap();
+        set.save_labeled(&path, "gold").unwrap();
         let loaded = CandidateSet::load(&path).unwrap();
         assert_eq!(loaded.pid, 42);
         assert_eq!(loaded.last_value, 12345);

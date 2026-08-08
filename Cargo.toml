@@ -2,7 +2,7 @@
 name = "tq2-trainer"
 version = "1.0.0"
 edition = "2024"
-description = "Linux-native Titan Quest II experience multiplier trainer (single-player / offline)"
+description = "Linux-native Titan Quest II trainer (EXP + gold; single-player / offline)"
 license = "MIT"
 readme = "README.md"
 keywords = ["titan-quest", "trainer", "linux", "proton"]

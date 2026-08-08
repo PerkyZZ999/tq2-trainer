@@ -19,3 +19,21 @@ entry_original = "44 8B FA 48 8B F1"
 
 supported_multipliers = [1, 2, 3, 5, 10]
 executable_sha256 = "79392aa1ed71e8ea01a77a3b40cc15d2f87a58a645b8a86f95cd361276ed73b0"
+
+[[gold_patch]]
+id = "tq2-ea-2026-08-gold"
+description = "SellItem payout override + GetGold one-shot grant trampoline"
+module = "TQ2-Win64-Shipping.exe"
+sell_payout_rva = 0x6D21FE3
+sell_payout_original = "44 8B 4C 24 58"
+sell_cave_rva = 0x6D22363
+sell_cave_len = 11
+getgold_rva = 0x6D3F340
+getgold_hook_offset = 0x25
+getgold_hook_original = "48 8B 8B 48 03 00 00"
+gold_cave_rva = 0xDFE8B1
+construct_rva = 0x5413230
+validate_rva = 0x5436940
+container_add_rva = 0x54052A0
+sum_helper_rva = 0x5415A50
+executable_sha256 = "79392aa1ed71e8ea01a77a3b40cc15d2f87a58a645b8a86f95cd361276ed73b0"
