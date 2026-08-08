@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn parse_executable_mapping() {
-        let line = "7f1234560000-7f1234580000 r-xp 00001000 08:01 99999 /mnt/data-z/SteamLibrary/steamapps/common/Titan Quest II/TQ2/Binaries/Win64/TQ2-Win64-Shipping.exe";
+        let line = "7f1234560000-7f1234580000 r-xp 00001000 08:01 99999 /path/to/steamapps/common/Titan Quest II/TQ2/Binaries/Win64/TQ2-Win64-Shipping.exe";
         let region = parse_maps_line(1, line).unwrap();
         assert_eq!(region.start, 0x7f1234560000);
         assert_eq!(region.end, 0x7f1234580000);

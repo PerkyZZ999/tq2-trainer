@@ -1,5 +1,4 @@
 # Rust
-
 /target/
 
 # Editor / OS
@@ -9,7 +8,15 @@
 .idea/
 .vscode/
 
-# Local research artifacts (may contain game memory)
+# Local research artifacts (may contain game memory addresses)
 /research-dumps/*
 !/research-dumps/README.md
+/gold-candidates.txt
+/exp-candidates.txt
 *.bin
+
+# Local env / accidental dumps
+.env
+*.pem
+core
+coredump*

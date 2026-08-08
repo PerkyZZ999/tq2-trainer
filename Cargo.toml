@@ -5,8 +5,12 @@ edition = "2024"
 description = "Linux-native Titan Quest II trainer (EXP + gold; single-player / offline)"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/PerkyZZ999/tq2-trainer"
+homepage = "https://github.com/PerkyZZ999/tq2-trainer"
+authors = ["PerkyZZ999"]
 keywords = ["titan-quest", "trainer", "linux", "proton"]
 categories = ["command-line-utilities"]
+exclude = ["research-dumps/*"]
 
 [dependencies]
 anyhow = "1"
