@@ -1,0 +1,21 @@
+# Titan Quest II EXP patch profile
+# Mirrors the constants in src/exp.rs — update both when a new build is researched.
+
+[[exp_patch]]
+id = "tq2-ea-2026-08-addxp"
+description = "AddXP native body — multiply incoming edx amount via INT3 cave trampoline"
+module = "TQ2-Win64-Shipping.exe"
+addxp_rva = 0x6B3A890
+entry_patch_offset = 0x10
+continue_offset = 0x16
+cave_offset = 0x262
+
+# Signature scans this prologue only (patch site bytes are excluded so status works while patched).
+prologue = "48 89 5C 24 20 55 56 41 57 48 81 EC C0 00 00 00"
+entry_original = "44 8B FA 48 8B F1"
+
+# Cave: imul edx,edx,imm8 ; mov r15d,edx ; mov rsi,rcx ; jmp continue
+# Entry: jmp cave ; nop
+
+supported_multipliers = [1, 2, 3, 5, 10]
+executable_sha256 = "79392aa1ed71e8ea01a77a3b40cc15d2f87a58a645b8a86f95cd361276ed73b0"

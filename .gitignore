@@ -1,0 +1,15 @@
+# Rust
+
+/target/
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Local research artifacts (may contain game memory)
+/research-dumps/*
+!/research-dumps/README.md
+*.bin
