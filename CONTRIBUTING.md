@@ -14,7 +14,7 @@ Thanks for taking an interest. This is a small single-player Linux trainer for T
    ```
 
 3. Do **not** commit files under `research-dumps/` (memory address dumps).
-4. If a game update moved code, update both `src/*.rs` constants and `signatures/tq2.toml`, and note the new executable SHA-256 in the docs.
+4. After a game update, update `signatures/tq2.toml` (SHA-256 + RVAs/prologues) and rebuild — that file is the build-profile source of truth.
 
 ## Bug reports
 

@@ -1,7 +1,6 @@
 # Titan Quest II EXP / gold patch profile
-# Reference mirror of constants in src/exp.rs, src/gold.rs, src/fingerprint.rs.
-# Update both this file and the Rust sources when a new build is researched.
-# (Future: load at runtime — see architecture review candidate "Signature profile".)
+# Single source of truth — loaded at runtime via `include_str!` in `src/profile.rs`.
+# Update this file when a new Shipping.exe build is researched (then rebuild).
 
 [[exp_patch]]
 id = "tq2-ea-2026-08-addxp"

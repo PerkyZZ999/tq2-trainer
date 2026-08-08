@@ -6,36 +6,42 @@ use crate::maps::ProcessMaps;
 use crate::memory::ProcessMemory;
 use crate::patch::{MemoryPatch, PatchState};
 use crate::process::GameProcess;
-use crate::scanner::{parse_pattern, scan_pattern, scan_pattern_chunked};
+use crate::profile::{bundled, exp_prologue_pattern};
+use crate::scanner::{scan_pattern, scan_pattern_chunked};
 use crate::x86::{encode_i32_le, jmp_rel, rel32};
 
-/// PE-relative RVA of the AddXP native body (from offline research).
-pub const ADDXP_RVA: usize = 0x6B3_A890;
+/// PE-relative RVA of the AddXP native body (from the bundled build profile).
+pub fn addxp_rva() -> usize {
+    bundled().exp.addxp_rva
+}
 
-/// Offset from AddXP entry to `mov r15d, edx` / patch site.
-pub const ENTRY_PATCH_OFFSET: usize = 0x10;
+fn entry_patch_offset() -> usize {
+    bundled().exp.entry_patch_offset
+}
 
-/// Offset from AddXP entry to the original `call` that follows the patch site.
-pub const CONTINUE_OFFSET: usize = 0x16;
+fn continue_offset() -> usize {
+    bundled().exp.continue_offset
+}
 
-/// Offset from AddXP entry to INT3 padding used as a tiny code cave.
-pub const CAVE_OFFSET: usize = 0x262;
+fn cave_offset() -> usize {
+    bundled().exp.cave_offset
+}
 
-/// Unique AddXP prologue used to validate the site (excludes the patchable tail).
-pub const ADDXP_PROLOGUE: &str = "48 89 5C 24 20 55 56 41 57 48 81 EC C0 00 00 00";
-
-/// Bytes immediately after the stable prologue (patch site).
-pub const ENTRY_ORIGINAL: [u8; 6] = [0x44, 0x8B, 0xFA, 0x48, 0x8B, 0xF1];
+fn entry_original() -> &'static [u8] {
+    bundled().exp.entry_original.as_slice()
+}
 
 const CAVE_LEN: usize = 14;
 
-/// Supported v1 presets.
+/// Supported v1 presets (also listed in the build profile).
 pub fn validate_multiplier(mult: u32) -> Result<u32> {
-    match mult {
-        1 | 2 | 3 | 5 | 10 => Ok(mult),
-        _ => Err(TrainerError::Other(format!(
-            "unsupported multiplier {mult}x (supported: 1, 2, 3, 5, 10)"
-        ))),
+    if bundled().exp.supported_multipliers.contains(&mult) {
+        Ok(mult)
+    } else {
+        Err(TrainerError::Other(format!(
+            "unsupported multiplier {mult}x (supported: {:?})",
+            bundled().exp.supported_multipliers
+        )))
     }
 }
 
@@ -50,7 +56,7 @@ pub struct ExpPatchSites {
 
 impl ExpPatchSites {
     pub fn from_module_base(module_base: usize) -> Self {
-        Self::from_addxp(module_base, module_base + ADDXP_RVA)
+        Self::from_addxp(module_base, module_base + addxp_rva())
     }
 
     /// Build patch sites from a discovered AddXP prologue address.
@@ -58,9 +64,9 @@ impl ExpPatchSites {
         Self {
             module_base,
             addxp,
-            entry: addxp + ENTRY_PATCH_OFFSET,
-            cave: addxp + CAVE_OFFSET,
-            continue_at: addxp + CONTINUE_OFFSET,
+            entry: addxp + entry_patch_offset(),
+            cave: addxp + cave_offset(),
+            continue_at: addxp + continue_offset(),
         }
     }
 }
@@ -81,7 +87,7 @@ fn validate_addxp_surroundings(mem: &ProcessMemory<'_>, sites: &ExpPatchSites) -
     let cave = mem.read_vec(sites.cave, CAVE_LEN)?;
     let entry = mem.read_vec(sites.entry, 6)?;
     let cave_ok = cave.iter().all(|&b| b == 0xCC) || looks_like_our_cave(&cave);
-    let entry_ok = entry == ENTRY_ORIGINAL || entry[0] == 0xE9;
+    let entry_ok = entry.as_slice() == entry_original() || entry[0] == 0xE9;
     if !cave_ok || !entry_ok {
         return Err(TrainerError::Other(format!(
             "AddXP site found at 0x{:x}, but surrounding bytes are unexpected.\n\
@@ -117,7 +123,7 @@ fn scan_addxp_in_executable(
 /// Locate and validate AddXP in the live process.
 pub fn locate_addxp(mem: &ProcessMemory<'_>, maps: &ProcessMaps) -> Result<ExpPatchSites> {
     let base = find_module_base(maps)?;
-    let pattern = parse_pattern(ADDXP_PROLOGUE).map_err(TrainerError::Other)?;
+    let pattern = exp_prologue_pattern()?;
     let prologue_len = pattern.len();
 
     let expected = ExpPatchSites::from_module_base(base);
@@ -183,7 +189,7 @@ pub fn build_multiplier_patches(
     entry.push(0x90); // nop
     debug_assert_eq!(entry.len(), 6);
 
-    let entry_patch = MemoryPatch::new(sites.entry, ENTRY_ORIGINAL.to_vec(), entry)?;
+    let entry_patch = MemoryPatch::new(sites.entry, entry_original().to_vec(), entry)?;
     let cave_patch = MemoryPatch::new(sites.cave, vec![0xCC; CAVE_LEN], cave)?;
     Ok((entry_patch, cave_patch))
 }
@@ -191,7 +197,7 @@ pub fn build_multiplier_patches(
 /// Detect currently applied multiplier, if our patch is present.
 pub fn detect_multiplier(mem: &ProcessMemory<'_>, sites: &ExpPatchSites) -> Result<Option<u32>> {
     let entry = mem.read_vec(sites.entry, 6)?;
-    if entry == ENTRY_ORIGINAL {
+    if entry.as_slice() == entry_original() {
         return Ok(Some(1));
     }
     if entry[0] != 0xE9 {
@@ -211,7 +217,7 @@ fn restore_sites(mem: &ProcessMemory<'_>, sites: &ExpPatchSites) -> Result<u32> 
     let cave_clean = cave.iter().all(|&b| b == 0xCC);
     let cave_ours = looks_like_our_cave(&cave);
 
-    if entry == ENTRY_ORIGINAL {
+    if entry.as_slice() == entry_original() {
         if cave_clean {
             return Ok(1);
         }
@@ -226,7 +232,7 @@ fn restore_sites(mem: &ProcessMemory<'_>, sites: &ExpPatchSites) -> Result<u32> 
     }
 
     if entry[0] == 0xE9 && cave_ours {
-        let entry_patch = MemoryPatch::new(sites.entry, ENTRY_ORIGINAL.to_vec(), entry)?;
+        let entry_patch = MemoryPatch::new(sites.entry, entry_original().to_vec(), entry)?;
         let cave_patch = MemoryPatch::new(sites.cave, vec![0xCC; CAVE_LEN], cave)?;
         entry_patch.restore(mem)?;
         cave_patch.restore(mem)?;
@@ -327,11 +333,11 @@ mod tests {
     #[test]
     fn from_addxp_uses_discovered_address_not_stale_rva() {
         let base = 0x1000_0000;
-        let moved = base + ADDXP_RVA + 0x1000;
+        let moved = base + addxp_rva() + 0x1000;
         let sites = ExpPatchSites::from_addxp(base, moved);
         assert_eq!(sites.module_base, base);
         assert_eq!(sites.addxp, moved);
-        assert_eq!(sites.entry, moved + ENTRY_PATCH_OFFSET);
-        assert_eq!(sites.cave, moved + CAVE_OFFSET);
+        assert_eq!(sites.entry, moved + entry_patch_offset());
+        assert_eq!(sites.cave, moved + cave_offset());
     }
 }

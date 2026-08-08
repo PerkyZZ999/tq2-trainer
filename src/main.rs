@@ -10,6 +10,7 @@ mod maps;
 mod memory;
 mod patch;
 mod process;
+mod profile;
 mod research;
 mod scanner;
 mod x86;

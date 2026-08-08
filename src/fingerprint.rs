@@ -9,10 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{Result, TrainerError};
 use crate::maps::ProcessMaps;
 use crate::process::GAME_EXE_NAME;
-
-/// SHA-256 of the researched `TQ2-Win64-Shipping.exe` (see `signatures/tq2.toml`).
-pub const EXPECTED_SHIPPING_SHA256: &str =
-    "79392aa1ed71e8ea01a77a3b40cc15d2f87a58a645b8a86f95cd361276ed73b0";
+use crate::profile::bundled;
 
 /// Resolve the on-disk Linux path for the mapped Shipping.exe, if present.
 pub fn shipping_exe_path(maps: &ProcessMaps) -> Result<PathBuf> {
@@ -59,11 +56,12 @@ pub fn assert_supported_build(maps: &ProcessMaps, force: bool) -> Result<String>
     if force {
         return Ok(hash);
     }
-    if hash != EXPECTED_SHIPPING_SHA256 {
+    let expected = &bundled().executable_sha256;
+    if hash != *expected {
         return Err(TrainerError::Other(format!(
             "unsupported Titan Quest II build.\n\
              Shipping.exe SHA-256: {hash}\n\
-             Expected:             {EXPECTED_SHIPPING_SHA256}\n\
+             Expected:             {expected}\n\
              No memory was modified.\n\
              Re-research signatures after a game update, or pass --force to override (unsafe)."
         )));
@@ -76,10 +74,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expected_hash_is_lowercase_hex() {
-        assert_eq!(EXPECTED_SHIPPING_SHA256.len(), 64);
+    fn expected_hash_comes_from_bundled_profile() {
+        assert_eq!(bundled().executable_sha256.len(), 64);
         assert!(
-            EXPECTED_SHIPPING_SHA256
+            bundled()
+                .executable_sha256
                 .chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         );

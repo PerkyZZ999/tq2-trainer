@@ -13,29 +13,41 @@ use crate::maps::ProcessMaps;
 use crate::memory::ProcessMemory;
 use crate::patch::{MemoryPatch, PatchState};
 use crate::process::GameProcess;
+use crate::profile::bundled;
 use crate::research::{CandidateSet, ResearchKind, ValueHit, filter_live, read_hit, snap_value};
 use crate::x86::{call_rel, encode_i32_le, jmp_rel};
 
-/// SellItem payout load site: `mov r9d, [rsp+0x58]` before inventory-add.
-pub const SELL_PAYOUT_RVA: usize = 0x6D_21FE3;
-pub const SELL_PAYOUT_ORIGINAL: [u8; 5] = [0x44, 0x8B, 0x4C, 0x24, 0x58];
-/// INT3 padding immediately after SellItem for large-amount trampoline.
-pub const SELL_CAVE_RVA: usize = 0x6D_22363;
-pub const SELL_CAVE_LEN: usize = 11;
+fn gold_layout() -> &'static crate::profile::GoldLayout {
+    &bundled().gold
+}
 
-/// GetGold body — hook before container/description are handed to the sum helper.
-pub const GETGOLD_RVA: usize = 0x6D_3F340;
-pub const GETGOLD_HOOK_OFFSET: usize = 0x25; // 0x6D3F365
-pub const GETGOLD_HOOK_ORIGINAL: [u8; 7] = [
-    0x48, 0x8B, 0x8B, 0x48, 0x03, 0x00, 0x00, // mov rcx, [rbx+0x348]
-];
-/// Large INT3 cave used for the one-shot grant trampoline.
-pub const GOLD_CAVE_RVA: usize = 0xDF_E8B1;
+fn sell_payout_original() -> &'static [u8] {
+    gold_layout().sell_payout_original.as_slice()
+}
 
-const CONSTRUCT_RVA: usize = 0x54_13230;
-const VALIDATE_RVA: usize = 0x54_36940;
-const CONTAINER_ADD_RVA: usize = 0x54_052A0;
-const SUM_HELPER_RVA: usize = 0x54_15A50;
+fn sell_cave_len() -> usize {
+    gold_layout().sell_cave_len
+}
+
+fn getgold_hook_original() -> &'static [u8] {
+    gold_layout().getgold_hook_original.as_slice()
+}
+
+fn construct_rva() -> usize {
+    gold_layout().construct_rva
+}
+
+fn validate_rva() -> usize {
+    gold_layout().validate_rva
+}
+
+fn container_add_rva() -> usize {
+    gold_layout().container_add_rva
+}
+
+fn sum_helper_rva() -> usize {
+    gold_layout().sum_helper_rva
+}
 
 const DEFAULT_WAIT: Duration = Duration::from_secs(300);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -52,13 +64,14 @@ pub struct GoldSites {
 
 impl GoldSites {
     pub fn from_module_base(module_base: usize) -> Self {
+        let g = gold_layout();
         Self {
             module_base,
-            sell_entry: module_base + SELL_PAYOUT_RVA,
-            sell_cave: module_base + SELL_CAVE_RVA,
-            getgold: module_base + GETGOLD_RVA,
-            getgold_hook: module_base + GETGOLD_RVA + GETGOLD_HOOK_OFFSET,
-            gold_cave: module_base + GOLD_CAVE_RVA,
+            sell_entry: module_base + g.sell_payout_rva,
+            sell_cave: module_base + g.sell_cave_rva,
+            getgold: module_base + g.getgold_rva,
+            getgold_hook: module_base + g.getgold_rva + g.getgold_hook_offset,
+            gold_cave: module_base + g.gold_cave_rva,
         }
     }
 }
@@ -67,8 +80,8 @@ pub fn locate_gold_sites(mem: &ProcessMemory<'_>, maps: &ProcessMaps) -> Result<
     let base = find_module_base(maps)?;
     let sites = GoldSites::from_module_base(base);
 
-    let sell = mem.read_vec(sites.sell_entry, SELL_PAYOUT_ORIGINAL.len())?;
-    let sell_ok = sell == SELL_PAYOUT_ORIGINAL
+    let sell = mem.read_vec(sites.sell_entry, sell_payout_original().len())?;
+    let sell_ok = sell.as_slice() == sell_payout_original()
         || sell[0] == 0xE9
         || sell == inline_sell_patch_bytes(1)
         || looks_like_inline_sell(&sell);
@@ -79,7 +92,7 @@ pub fn locate_gold_sites(mem: &ProcessMemory<'_>, maps: &ProcessMaps) -> Result<
         )));
     }
 
-    let cave = mem.read_vec(sites.sell_cave, SELL_CAVE_LEN)?;
+    let cave = mem.read_vec(sites.sell_cave, sell_cave_len())?;
     let cave_ok = cave.iter().all(|&b| b == 0xCC) || looks_like_sell_cave(&cave);
     if !cave_ok {
         return Err(TrainerError::Other(format!(
@@ -88,8 +101,8 @@ pub fn locate_gold_sites(mem: &ProcessMemory<'_>, maps: &ProcessMaps) -> Result<
         )));
     }
 
-    let hook = mem.read_vec(sites.getgold_hook, GETGOLD_HOOK_ORIGINAL.len())?;
-    let hook_ok = hook == GETGOLD_HOOK_ORIGINAL || hook[0] == 0xE9;
+    let hook = mem.read_vec(sites.getgold_hook, getgold_hook_original().len())?;
+    let hook_ok = hook.as_slice() == getgold_hook_original() || hook[0] == 0xE9;
     if !hook_ok {
         return Err(TrainerError::Other(format!(
             "GetGold hook site unexpected at 0x{:x}: {hook:02x?}",
@@ -119,7 +132,7 @@ fn looks_like_inline_sell(bytes: &[u8]) -> bool {
 
 fn looks_like_sell_cave(cave: &[u8]) -> bool {
     // mov r9d, imm32 ; jmp back
-    cave.len() == SELL_CAVE_LEN && cave[0] == 0x41 && cave[1] == 0xB9 && cave[6] == 0xE9
+    cave.len() == sell_cave_len() && cave[0] == 0x41 && cave[1] == 0xB9 && cave[6] == 0xE9
 }
 
 /// Build reversible patches that force the next SellItem gold payout to `amount`.
@@ -136,40 +149,40 @@ pub fn build_sell_gold_patches(
     if let Ok(imm8) = u8::try_from(amount) {
         let entry = MemoryPatch::new(
             sites.sell_entry,
-            SELL_PAYOUT_ORIGINAL.to_vec(),
+            sell_payout_original().to_vec(),
             inline_sell_patch_bytes(imm8).to_vec(),
         )?;
         return Ok((entry, None));
     }
 
     // mov r9d, imm32 ; jmp sell_entry+5
-    let mut cave = Vec::with_capacity(SELL_CAVE_LEN);
+    let mut cave = Vec::with_capacity(sell_cave_len());
     cave.extend_from_slice(&[0x41, 0xB9]);
     cave.extend_from_slice(&encode_i32_le(amount));
     cave.extend_from_slice(&jmp_rel(
         sites.sell_cave + 6,
-        sites.sell_entry + SELL_PAYOUT_ORIGINAL.len(),
+        sites.sell_entry + sell_payout_original().len(),
     )?);
-    debug_assert_eq!(cave.len(), SELL_CAVE_LEN);
+    debug_assert_eq!(cave.len(), sell_cave_len());
 
     let mut entry = Vec::with_capacity(5);
     entry.extend_from_slice(&jmp_rel(sites.sell_entry, sites.sell_cave)?);
 
-    let entry_patch = MemoryPatch::new(sites.sell_entry, SELL_PAYOUT_ORIGINAL.to_vec(), entry)?;
-    let cave_patch = MemoryPatch::new(sites.sell_cave, vec![0xCC; SELL_CAVE_LEN], cave)?;
+    let entry_patch = MemoryPatch::new(sites.sell_entry, sell_payout_original().to_vec(), entry)?;
+    let cave_patch = MemoryPatch::new(sites.sell_cave, vec![0xCC; sell_cave_len()], cave)?;
     Ok((entry_patch, Some(cave_patch)))
 }
 
 fn restore_sell_sites(mem: &ProcessMemory<'_>, sites: &GoldSites) -> Result<()> {
     let entry = mem.read_vec(sites.sell_entry, 5)?;
-    let cave = mem.read_vec(sites.sell_cave, SELL_CAVE_LEN)?;
+    let cave = mem.read_vec(sites.sell_cave, sell_cave_len())?;
 
-    if entry == SELL_PAYOUT_ORIGINAL {
+    if entry.as_slice() == sell_payout_original() {
         if cave.iter().all(|&b| b == 0xCC) {
             return Ok(());
         }
         if looks_like_sell_cave(&cave) {
-            let patch = MemoryPatch::new(sites.sell_cave, vec![0xCC; SELL_CAVE_LEN], cave)?;
+            let patch = MemoryPatch::new(sites.sell_cave, vec![0xCC; sell_cave_len()], cave)?;
             return patch.restore(mem);
         }
         return Err(TrainerError::Other(
@@ -178,13 +191,14 @@ fn restore_sell_sites(mem: &ProcessMemory<'_>, sites: &GoldSites) -> Result<()> 
     }
 
     if looks_like_inline_sell(&entry) {
-        let patch = MemoryPatch::new(sites.sell_entry, SELL_PAYOUT_ORIGINAL.to_vec(), entry)?;
+        let patch = MemoryPatch::new(sites.sell_entry, sell_payout_original().to_vec(), entry)?;
         return patch.restore(mem);
     }
 
     if entry[0] == 0xE9 && looks_like_sell_cave(&cave) {
-        let entry_patch = MemoryPatch::new(sites.sell_entry, SELL_PAYOUT_ORIGINAL.to_vec(), entry)?;
-        let cave_patch = MemoryPatch::new(sites.sell_cave, vec![0xCC; SELL_CAVE_LEN], cave)?;
+        let entry_patch =
+            MemoryPatch::new(sites.sell_entry, sell_payout_original().to_vec(), entry)?;
+        let cave_patch = MemoryPatch::new(sites.sell_cave, vec![0xCC; sell_cave_len()], cave)?;
         entry_patch.restore(mem)?;
         cave_patch.restore(mem)?;
         return Ok(());
@@ -413,10 +427,10 @@ pub fn build_one_shot_gold_patches(
     }
 
     let base = sites.module_base;
-    let construct = base + CONSTRUCT_RVA;
-    let validate = base + VALIDATE_RVA;
-    let container_add = base + CONTAINER_ADD_RVA;
-    let sum_helper = base + SUM_HELPER_RVA;
+    let construct = base + construct_rva();
+    let validate = base + validate_rva();
+    let container_add = base + container_add_rva();
+    let sum_helper = base + sum_helper_rva();
 
     // Cave layout (position-independent via rel32 calls/jmps):
     //   push rdi; push rsi; push r12; push r13; push r14
@@ -532,7 +546,8 @@ pub fn build_one_shot_gold_patches(
     entry.extend_from_slice(&jmp_rel(sites.getgold_hook, sites.gold_cave)?);
     entry.extend_from_slice(&[0x90, 0x90]); // pad to 7 bytes
 
-    let entry_patch = MemoryPatch::new(sites.getgold_hook, GETGOLD_HOOK_ORIGINAL.to_vec(), entry)?;
+    let entry_patch =
+        MemoryPatch::new(sites.getgold_hook, getgold_hook_original().to_vec(), entry)?;
     let cave_patch = MemoryPatch::new(sites.gold_cave, vec![0xCC; cave_len], cave)?;
     Ok((entry_patch, cave_patch))
 }
@@ -550,7 +565,7 @@ fn restore_one_shot_sites(
     let hook = mem.read_vec(sites.getgold_hook, 7)?;
     let cave = mem.read_vec(sites.gold_cave, cave_len)?;
 
-    if hook == GETGOLD_HOOK_ORIGINAL {
+    if hook.as_slice() == getgold_hook_original() {
         if cave.iter().all(|&b| b == 0xCC) {
             return Ok(());
         }
@@ -565,7 +580,7 @@ fn restore_one_shot_sites(
 
     if hook[0] == 0xE9 && looks_like_gold_cave(&cave) {
         let entry_patch =
-            MemoryPatch::new(sites.getgold_hook, GETGOLD_HOOK_ORIGINAL.to_vec(), hook)?;
+            MemoryPatch::new(sites.getgold_hook, getgold_hook_original().to_vec(), hook)?;
         let cave_patch = MemoryPatch::new(sites.gold_cave, vec![0xCC; cave_len], cave)?;
         entry_patch.restore(mem)?;
         cave_patch.restore(mem)?;
@@ -704,7 +719,7 @@ mod tests {
         let (entry, cave) = build_sell_gold_patches(&sites, 123).unwrap();
         assert!(cave.is_none());
         assert_eq!(entry.replacement, inline_sell_patch_bytes(123));
-        assert_eq!(entry.original, SELL_PAYOUT_ORIGINAL);
+        assert_eq!(entry.original, sell_payout_original());
     }
 
     #[test]

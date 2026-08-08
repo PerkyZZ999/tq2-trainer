@@ -17,8 +17,10 @@ exclude = ["research-dumps/*"]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2"
+toml = "0.8"
 
 [profile.release]
 lto = true
