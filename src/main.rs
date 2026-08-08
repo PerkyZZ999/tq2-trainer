@@ -1,5 +1,6 @@
 //! Titan Quest II native EXP trainer (Linux).
 
+mod balance_watch;
 mod cli;
 mod error;
 mod exp;

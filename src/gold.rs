@@ -4,8 +4,9 @@
 //! game's inventory grant path (validated 2026-08-08).
 
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::balance_watch::wait_for_balance;
 use crate::error::{Result, TrainerError};
 use crate::exp::find_module_base;
 use crate::fingerprint::assert_supported_build;
@@ -50,7 +51,6 @@ fn sum_helper_rva() -> usize {
 }
 
 const DEFAULT_WAIT: Duration = Duration::from_secs(300);
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct GoldSites {
@@ -262,53 +262,6 @@ fn locate_balance_mirrors(
         )));
     }
     Ok((current, set.hits))
-}
-
-fn wait_for_balance(
-    process: &GameProcess,
-    before: i64,
-    after: i64,
-    hits: &[ValueHit],
-    timeout: Duration,
-) -> Result<usize> {
-    let mem = ProcessMemory::new(process);
-    // Only watch addresses that currently hold `before` — stray `after` hits are not a grant.
-    let watchers: Vec<&ValueHit> = hits
-        .iter()
-        .filter(|h| read_hit(&mem, h).ok() == Some(before))
-        .collect();
-    if watchers.is_empty() {
-        return Err(TrainerError::Other(format!(
-            "no live gold mirrors currently hold {before}; pass an exact --current value"
-        )));
-    }
-
-    let need = 1;
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        process.ensure_alive()?;
-        let mut transitioned = 0usize;
-        for hit in &watchers {
-            match read_hit(&mem, hit) {
-                Ok(v) if v == after => transitioned += 1,
-                Ok(_)
-                | Err(TrainerError::MemoryRead { .. })
-                | Err(TrainerError::PermissionDenied) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        // A watched mirror that held `before` at arm-time and now holds `after` is enough.
-        // (Most snap hits are sticky caches; requiring 2+ transitions timed out on real sales.)
-        if transitioned >= need {
-            return Ok(transitioned);
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
-    Err(TrainerError::Other(format!(
-        "timed out after {}s waiting for gold {before} -> {after} \
-         (need a watched mirror to update; run `sell-gold --disarm` if still armed)",
-        timeout.as_secs()
-    )))
 }
 
 #[derive(Debug, Clone)]
